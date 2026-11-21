@@ -2,7 +2,6 @@
 name: Build Authorized Shorts Queue
 
 on:
-  workflow_dispatch:
   workflow_run:
     workflows: ["GTA6 Global Discovery"]
     types:
@@ -10,10 +9,11 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   build:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -25,10 +25,18 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Download discovery report
+        uses: actions/download-artifact@v4
+        with:
+          name: gta6-discovery-report
+          path: reports
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+
       - name: Build authorized queue
         run: python queue_builder.py
 
-      - name: Save queue report
+      - name: Save approved queue
         uses: actions/upload-artifact@v4
         with:
           name: gta6-approved-queue
