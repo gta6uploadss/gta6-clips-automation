@@ -11,13 +11,18 @@ from googleapiclient.errors import HttpError
 API_KEY = os.environ["YOUTUBE_API_KEY"]
 youtube = build("youtube", "v3", developerKey=API_KEY)
 
-HISTORY_FILE = "data/history.json"
-SEARCH_QUERY = '"GTA 6"|"GTA VI"|"Grand Theft Auto VI"'
+SEARCH_QUERY = (
+    '"GTA 6"|"GTA VI"|'
+    '"Grand Theft Auto VI"|"Grand Theft Auto 6"'
+)
 
 GTA6_PATTERN = re.compile(
-    r"\b(gta\s*6|gta\s*vi|grand theft auto\s*(vi|6))\b",
+    r"\b(gta\s*6|gta\s*vi|grand theft auto\s*(6|vi))\b",
     re.IGNORECASE
 )
+
+HISTORY_FILE = "data/history.json"
+MAX_SNAPSHOTS = 30
 
 
 def is_relevant(video):
@@ -59,11 +64,15 @@ def collect():
             for item in discover(event_type):
                 video_id = item["id"]["videoId"]
 
-                candidates.setdefault(video_id, {
-                    "video_id": video_id,
-                    "event_type": event_type,
-                    "url": f"https://www.youtube.com/watch?v={video_id}"
-                })
+                if video_id not in candidates:
+                    candidates[video_id] = {
+                        "video_id": video_id,
+                        "event_type": event_type,
+                        "url": (
+                            "https://www.youtube.com/watch?v="
+                            + video_id
+                        )
+                    }
 
         except HttpError as error:
             print(f"Discovery error: {error}")
@@ -71,7 +80,29 @@ def collect():
     return list(candidates.values())
 
 
-def add_statistics(videos):
+def load_history():
+    os.makedirs("data", exist_ok=True)
+
+    if not os.path.exists(HISTORY_FILE):
+        return {}
+
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except (json.JSONDecodeError, OSError):
+        print("Warning: History file could not be read.")
+        return {}
+
+
+def save_history(history):
+    with open(HISTORY_FILE, "w", encoding="utf-8") as file:
+        json.dump(history, file, indent=2)
+
+
+def add_statistics(videos, history):
+    now = datetime.now(timezone.utc)
+    timestamp = now.isoformat()
+
     for start in range(0, len(videos), 50):
         batch = videos[start:start + 50]
         ids = ",".join(v["video_id"] for v in batch)
@@ -81,14 +112,13 @@ def add_statistics(videos):
             id=ids
         ).execute()
 
-        batch_lookup = {v["video_id"]: v for v in batch}
-
         for item in response.get("items", []):
-            video = batch_lookup.get(item["id"])
-            if not video:
-                continue
+            video = next(
+                v for v in batch if v["video_id"] == item["id"]
+            )
 
             snippet = item.get("snippet", {})
+
             video.update({
                 "title": snippet.get("title", ""),
                 "description": snippet.get("description", ""),
@@ -113,143 +143,120 @@ def add_statistics(videos):
 
             views = int(stats.get("viewCount", 0))
             likes = int(stats.get("likeCount", 0))
-            comments = int(stats.get("commentCount", 0))
+            comments = stats.get("commentCount")
             viewers = int(live.get("concurrentViewers", 0))
 
             video.update({
                 "views": views,
                 "likes": likes,
-                "comments": comments,
+                "comments": (
+                    int(comments) if comments is not None else None
+                ),
                 "concurrent_viewers": viewers
             })
 
+            # Compare with the most recent saved snapshot.
+            snapshots = history.get(video["video_id"], [])
+            previous = snapshots[-1] if snapshots else None
+
+            views_per_hour = 0.0
+            growth_available = False
+
+            if previous:
+                previous_time = datetime.fromisoformat(
+                    previous["timestamp"]
+                )
+                elapsed = (
+                    now - previous_time
+                ).total_seconds() / 3600
+
+                if elapsed >= 0.1:
+                    gained = max(
+                        0,
+                        views - int(previous["views"])
+                    )
+                    views_per_hour = gained / elapsed
+                    growth_available = True
+
+            # Save this run's snapshot.
+            snapshots.append({
+                "timestamp": timestamp,
+                "views": views,
+                "concurrent_viewers": viewers
+            })
+
+            history[video["video_id"]] = snapshots[-MAX_SNAPSHOTS:]
+
+            # Calculate ranking components.
             published = datetime.fromisoformat(
                 video["published_at"].replace("Z", "+00:00")
             )
 
             age_hours = max(
                 0,
-                (datetime.now(timezone.utc) - published).total_seconds()
-                / 3600
+                (now - published).total_seconds() / 3600
             )
 
-            popularity = min(math.log10(views + 1) / 7, 1)
+            popularity = min(
+                math.log10(views + 1) / 7, 1
+            )
 
-            # Missing comments are not treated as proof of zero engagement.
             engagement = min(
-                ((likes + comments * 2) / max(views, 1)) / 0.08,
-                1
+                (likes / max(views, 1)) / 0.08, 1
             )
 
-            live_score = min(math.log10(viewers + 1) / 5, 1)
-            freshness = max(0, 1 - age_hours / (30 * 24))
+            live_score = min(
+                math.log10(viewers + 1) / 5, 1
+            )
 
-            base_score = (
-                popularity * 0.35
-                + engagement * 0.20
-                + live_score * 0.25
-                + freshness * 0.20
-            ) * 100
+            freshness = max(
+                0,
+                1 - age_hours / (30 * 24)
+            )
 
-            video["base_score"] = round(base_score, 2)
-            video["score"] = round(base_score, 2)
+            growth_score = min(
+                math.log10(views_per_hour + 1) / 3, 1
+            )
 
-    return [v for v in videos if v.get("relevant") is True]
-
-
-def load_history():
-    os.makedirs("data", exist_ok=True)
-
-    if not os.path.exists(HISTORY_FILE):
-        return {}
-
-    try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as file:
-            return json.load(file)
-    except (json.JSONDecodeError, OSError):
-        print("History file unreadable. Starting a fresh history.")
-        return {}
-
-
-def update_history(videos):
-    history = load_history()
-    now = datetime.now(timezone.utc)
-    timestamp = now.isoformat()
-
-    for video in videos:
-        video_id = video["video_id"]
-        snapshots = history.setdefault(video_id, [])
-
-        # Keep only the last 30 days.
-        cutoff = now - timedelta(days=30)
-        snapshots = [
-            s for s in snapshots
-            if datetime.fromisoformat(s["timestamp"]) >= cutoff
-        ]
-
-        previous = snapshots[-1] if snapshots else None
-
-        current_snapshot = {
-            "timestamp": timestamp,
-            "views": video["views"],
-            "concurrent_viewers": video["concurrent_viewers"]
-        }
-
-        if previous:
-            previous_time = datetime.fromisoformat(previous["timestamp"])
-            elapsed_hours = (
-                now - previous_time
-            ).total_seconds() / 3600
-
-            if elapsed_hours > 0:
-                views_gained = max(
-                    0, video["views"] - previous["views"]
-                )
-
-                views_per_hour = views_gained / elapsed_hours
-
-                growth_score = min(
-                    math.log10(views_per_hour + 1) / 4,
-                    1
+            if growth_available:
+                score = (
+                    popularity * 0.25
+                    + engagement * 0.15
+                    + live_score * 0.20
+                    + freshness * 0.15
+                    + growth_score * 0.25
+                ) * 100
+            else:
+                # First snapshot: rank without growth data.
+                score = (
+                    popularity * 0.35
+                    + engagement * 0.20
+                    + live_score * 0.25
+                    + freshness * 0.20
                 ) * 100
 
-                video["previous_views"] = previous["views"]
-                video["views_gained"] = views_gained
-                video["views_per_hour"] = round(views_per_hour, 2)
-                video["growth_score"] = round(growth_score, 2)
+            video["views_per_hour"] = round(
+                views_per_hour, 2
+            )
+            video["growth_available"] = growth_available
+            video["snapshot_count"] = len(snapshots)
+            video["score"] = round(score, 2)
 
-                # Combine existing popularity score with measured growth.
-                video["score"] = round(
-                    video["base_score"] * 0.75
-                    + growth_score * 0.25,
-                    2
-                )
+    save_history(history)
 
-                video["growth_tracking"] = "Historical comparison available"
-            else:
-                video["growth_tracking"] = "Waiting for next snapshot"
-        else:
-            video["growth_tracking"] = "Baseline saved; awaiting next run"
-
-        snapshots.append(current_snapshot)
-
-        # Retain a maximum of 20 snapshots per video.
-        history[video_id] = snapshots[-20:]
-
-    with open(HISTORY_FILE, "w", encoding="utf-8") as file:
-        json.dump(history, file, indent=2)
-
-    print(f"Historical data updated for {len(videos)} videos.")
+    return [
+        v for v in videos
+        if v.get("relevant") is True
+    ]
 
 
 def main():
     print("GTA 6 GLOBAL DISCOVERY V3")
     print("=" * 40)
 
+    history = load_history()
     videos = collect()
-    videos = add_statistics(videos)
-
-    update_history(videos)
+    videos = add_statistics(videos, history)
 
     videos.sort(
         key=lambda x: x.get("score", 0),
@@ -260,8 +267,9 @@ def main():
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "total_discovered": len(videos),
         "ranking_method": (
-            "Base score 75%, historical views-per-hour growth 25% "
-            "when historical data is available"
+            "Popularity 25%, Engagement 15%, "
+            "Live Viewers 20%, Freshness 15%, "
+            "Growth 25% when historical data is available"
         ),
         "videos": videos
     }
@@ -278,13 +286,15 @@ def main():
         json.dump(report, file, indent=2, ensure_ascii=False)
 
     print(f"Total relevant videos: {len(videos)}")
+    print(f"History entries: {len(history)}")
     print(f"Report saved: {filename}")
 
     for video in videos[:15]:
         print(
             video["score"],
+            "growth:", video["views_per_hour"],
+            "views/hour",
             video["event_type"],
-            video.get("views_per_hour", "Awaiting history"),
             video["title"],
             video["url"]
         )
