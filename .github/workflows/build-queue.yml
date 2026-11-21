@@ -1,0 +1,37 @@
+
+name: Build Authorized Shorts Queue
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["GTA6 Global Discovery"]
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build authorized queue
+        run: python queue_builder.py
+
+      - name: Save queue report
+        uses: actions/upload-artifact@v4
+        with:
+          name: gta6-approved-queue
+          path: data/approved_queue.json
+          if-no-files-found: error
+          retention-days: 7
