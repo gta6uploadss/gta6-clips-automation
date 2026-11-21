@@ -40,6 +40,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gta6-approved-queue
-          path: data/approved_queue.json
+          path: data/trend_queue.json
           if-no-files-found: error
           retention-days: 7
