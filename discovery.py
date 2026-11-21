@@ -1,78 +1,84 @@
 
 import os
+import re
 import json
-from datetime import datetime, timezone
+import math
+from datetime import datetime, timezone, timedelta
+
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 API_KEY = os.environ["YOUTUBE_API_KEY"]
 
-youtube = build(
-    "youtube",
-    "v3",
-    developerKey=API_KEY
+youtube = build("youtube", "v3", developerKey=API_KEY)
+
+SEARCH_QUERY = '"GTA 6"|"GTA VI"|"Grand Theft Auto VI"'
+
+GTA6_PATTERN = re.compile(
+    r"\b(gta\s*6|gta\s*vi|grand theft auto\s*vi)\b",
+    re.IGNORECASE
 )
 
-LANGUAGES = {
-    "English": ("en", "GTA 6"),
-    "Hindi": ("hi", "GTA 6 Hindi"),
-    "Malayalam": ("ml", "GTA 6 Malayalam"),
-    "Tamil": ("ta", "GTA 6 Tamil"),
-    "Spanish": ("es", "GTA 6 español"),
-    "Portuguese": ("pt", "GTA 6 português"),
-    "Japanese": ("ja", "GTA 6"),
-    "Korean": ("ko", "GTA 6"),
-    "Arabic": ("ar", "GTA 6"),
-    "Indonesian": ("id", "GTA 6 Indonesia")
-}
 
-def discover(language, lang_code, query, event_type):
-    print(f"Searching: {language} | {event_type}")
+def is_relevant(video):
+    title = video.get("snippet", {}).get("title", "")
+    description = video.get("snippet", {}).get("description", "")
+    tags = video.get("snippet", {}).get("tags", [])
 
-    response = youtube.search().list(
-        part="snippet",
-        q=query,
-        type="video",
-        eventType=event_type,
-        order="viewCount",
-        relevanceLanguage=lang_code,
-        maxResults=10
-    ).execute()
+    text = " ".join([title, description, " ".join(tags)])
+
+    return bool(GTA6_PATTERN.search(text))
+
+
+def discover(event_type):
+    print(f"Searching globally: {event_type}")
+
+    params = {
+        "part": "snippet",
+        "q": SEARCH_QUERY,
+        "type": "video",
+        "eventType": event_type,
+        "order": "viewCount",
+        "maxResults": 50
+    }
+
+    if event_type == "completed":
+        published_after = (
+            datetime.now(timezone.utc) - timedelta(days=30)
+        ).isoformat()
+
+        params["publishedAfter"] = published_after
+
+    response = youtube.search().list(**params).execute()
 
     return response.get("items", [])
+
 
 def collect():
     candidates = {}
 
-    for language, (code, query) in LANGUAGES.items():
-        for event in ["live", "completed"]:
-            try:
-                results = discover(
-                    language, code, query, event
-                )
+    for event_type in ["live", "completed"]:
+        try:
+            results = discover(event_type)
 
-                for item in results:
-                    video_id = item["id"]["videoId"]
+            for item in results:
+                video_id = item["id"]["videoId"]
 
-                    if video_id not in candidates:
-                        candidates[video_id] = {
-                            "video_id": video_id,
-                            "title": item["snippet"]["title"],
-                            "channel": item["snippet"]["channelTitle"],
-                            "channel_id": item["snippet"]["channelId"],
-                            "published_at": item["snippet"]["publishedAt"],
-                            "language_search": language,
-                            "event_type": event,
-                            "url": (
-                                "https://www.youtube.com/watch?v="
-                                + video_id
-                            )
-                        }
+                if video_id not in candidates:
+                    candidates[video_id] = {
+                        "video_id": video_id,
+                        "event_type": event_type,
+                        "url": (
+                            "https://www.youtube.com/watch?v="
+                            + video_id
+                        )
+                    }
 
-            except HttpError as error:
-                print(f"API error: {error}")
+        except HttpError as error:
+            print(f"Discovery error: {error}")
 
     return list(candidates.values())
+
 
 def add_statistics(videos):
     for start in range(0, len(videos), 50):
@@ -80,7 +86,7 @@ def add_statistics(videos):
         ids = ",".join(v["video_id"] for v in batch)
 
         response = youtube.videos().list(
-            part="statistics,liveStreamingDetails,snippet",
+            part="snippet,statistics,liveStreamingDetails",
             id=ids
         ).execute()
 
@@ -89,6 +95,25 @@ def add_statistics(videos):
                 v for v in batch
                 if v["video_id"] == item["id"]
             )
+
+            snippet = item.get("snippet", {})
+
+            video["title"] = snippet.get("title", "")
+            video["description"] = snippet.get("description", "")
+            video["channel"] = snippet.get("channelTitle", "")
+            video["channel_id"] = snippet.get("channelId", "")
+            video["published_at"] = snippet.get("publishedAt", "")
+            video["language"] = (
+                snippet.get("defaultAudioLanguage")
+                or snippet.get("defaultLanguage")
+                or "unknown"
+            )
+
+            if not is_relevant(item):
+                video["relevant"] = False
+                continue
+
+            video["relevant"] = True
 
             stats = item.get("statistics", {})
             live = item.get("liveStreamingDetails", {})
@@ -105,35 +130,51 @@ def add_statistics(videos):
                 "concurrent_viewers": viewers
             })
 
-            # Popularity, engagement and live audience proxy.
-            engagement = (
-                (likes + comments * 2) / max(views, 1)
+            published = datetime.fromisoformat(
+                video["published_at"].replace("Z", "+00:00")
             )
 
-            import math
+            age_hours = max(
+                0,
+                (datetime.now(timezone.utc) - published).total_seconds()
+                / 3600
+            )
 
-            popularity = math.log10(views + 1) / 10
-            engagement_score = min(engagement * 100, 1)
+            popularity = min(math.log10(views + 1) / 7, 1)
+
+            engagement = min(
+                ((likes + comments * 2) / max(views, 1)) / 0.08,
+                1
+            )
+
             live_score = min(
-                math.log10(viewers + 1) / 5, 1
+                math.log10(viewers + 1) / 5,
+                1
             )
 
-            video["score"] = round(
-                (
-                    popularity * 0.35
-                    + engagement_score * 0.20
-                    + live_score * 0.15
-                    + 0.30 * 0.5
-                ) * 100,
-                2
+            freshness = max(
+                0,
+                1 - age_hours / (30 * 24)
             )
 
-            video["growth_tracking"] = "Not yet measured"
+            score = (
+                popularity * 0.35
+                + engagement * 0.20
+                + live_score * 0.25
+                + freshness * 0.20
+            ) * 100
 
-    return videos
+            video["score"] = round(score, 2)
+            video["growth_tracking"] = "Pending historical snapshots"
+
+    return [
+        v for v in videos
+        if v.get("relevant") is True
+    ]
+
 
 def main():
-    print("GTA 6 GLOBAL DISCOVERY ENGINE")
+    print("GTA 6 GLOBAL DISCOVERY V2")
     print("=" * 40)
 
     videos = collect()
@@ -145,11 +186,12 @@ def main():
     )
 
     report = {
-        "generated_at": datetime.now(
-            timezone.utc
-        ).isoformat(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "total_discovered": len(videos),
-        "ranking_method": "Initial popularity and engagement proxy",
+        "ranking_method": (
+            "Popularity 35%, Engagement 20%, "
+            "Live Viewers 25%, Freshness 20%"
+        ),
         "videos": videos
     }
 
@@ -164,15 +206,17 @@ def main():
     with open(filename, "w", encoding="utf-8") as file:
         json.dump(report, file, indent=2, ensure_ascii=False)
 
-    print(f"Discovered: {len(videos)} videos")
+    print(f"Total relevant videos: {len(videos)}")
     print(f"Report saved: {filename}")
 
-    for video in videos[:10]:
+    for video in videos[:15]:
         print(
             video["score"],
+            video["event_type"],
             video["title"],
             video["url"]
         )
+
 
 if __name__ == "__main__":
     main()
